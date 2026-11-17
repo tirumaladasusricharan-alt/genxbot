@@ -16,8 +16,8 @@ A local RAG pipeline that only ever learns from **client coaching calls**. It an
 **Prerequisites:** Docker Desktop (or Docker Engine + Compose v2), and a free Groq API key from https://console.groq.com/keys.
 
 ```bash
-git clone <this-repo-url> genx-rag-assessment
-cd genx-rag-assessment
+git clone https://github.com/tirumaladasusricharan-alt/genxbot.git
+cd genxbot
 cp .env.example .env          # then paste your key into GROQ_API_KEY=
 docker compose up -d
 docker compose wait n8n-publish   # returns 0 once the chatbot webhook is live
