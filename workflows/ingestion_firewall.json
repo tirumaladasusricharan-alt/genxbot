@@ -1,0 +1,498 @@
+{
+  "id": "IngestFirewall01",
+  "name": "A · Ingestion & Semantic Firewall",
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner"
+  },
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": true
+  },
+  "tags": [],
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "8de31b06-9809-41ae-a7ee-25c95d64fd99",
+      "name": "Run Ingestion",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "fileSelector": "/data/mock_transcripts.json",
+        "options": {}
+      },
+      "id": "6721b0c5-68b7-40ec-a009-cb78601d8413",
+      "name": "Read Transcripts File",
+      "type": "n8n-nodes-base.readWriteFile",
+      "typeVersion": 1,
+      "position": [
+        220,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "fromJson",
+        "options": {}
+      },
+      "id": "3ac69cdb-47ec-45ff-ad8b-903becfe9cce",
+      "name": "Extract JSON",
+      "type": "n8n-nodes-base.extractFromFile",
+      "typeVersion": 1,
+      "position": [
+        440,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Node: \"Split & Sample Transcripts\"   (Code · Run Once for All Items)\n// -----------------------------------------------------------------------------\n// Input : the parsed mock_transcripts.json from \"Extract JSON\".\n// Output: one item per session, plus a BOUNDED sample (first 40 + last 20 turns)\n//         that is the only thing the classifier ever sees.\n// -----------------------------------------------------------------------------\nconst HEAD_TURNS = 40;\nconst TAIL_TURNS = 20;\n\n// \"Extract From File\" may hand us { data: [...] }, a single session, or one item\n// per session depending on version/settings. Accept all shapes.\nfunction extractSessions(items) {\n  const sessions = [];\n  for (const { json } of items) {\n    if (Array.isArray(json)) sessions.push(...json);\n    else if (Array.isArray(json?.data)) sessions.push(...json.data);\n    else if (json?.data?.transcript) sessions.push(json.data);\n    else if (json?.transcript) sessions.push(json);\n  }\n  return sessions;\n}\n\n// First 40 + last 20 turns. Short transcripts (<= 60 turns) are sent whole,\n// so no turn is ever duplicated or dropped from the middle unnecessarily.\nfunction boundedSample(turns) {\n  if (turns.length <= HEAD_TURNS + TAIL_TURNS) return turns;\n  return [...turns.slice(0, HEAD_TURNS), ...turns.slice(-TAIL_TURNS)];\n}\n\nconst formatTurn = (t) => `[${t.timestamp ?? '--:--:--'}] ${t.speaker ?? 'Unknown'}: ${t.text.trim()}`;\n\nconst sessions = extractSessions($input.all());\nif (sessions.length === 0) {\n  throw new Error('No sessions found. Expected an array of sessions in /data/mock_transcripts.json');\n}\n\nreturn sessions.map((session) => {\n  const turns = (Array.isArray(session.transcript) ? session.transcript : [])\n    .filter((t) => t && typeof t.text === 'string' && t.text.trim() !== '');\n  const sample = boundedSample(turns);\n\n  return {\n    json: {\n      session_id: String(session.id ?? '').trim() || 'UNKNOWN',\n      title: session.title ?? '',\n      session_created_at: session.created_at ?? null,\n      participants: Array.isArray(session.participants) ? session.participants : [],\n      transcript: turns,\n      total_turn_count: turns.length,\n      sample_turn_count: sample.length,\n      sample_text: sample.map(formatTurn).join('\\n'),\n    },\n    pairedItem: { item: 0 },\n  };\n});\n"
+      },
+      "id": "a593b73f-df31-4e64-a579-f1c5777d514b",
+      "name": "Split & Sample Transcripts",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        660,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Node: \"Build Classifier Request\"   (Code · Run Once for Each Item)\n// -----------------------------------------------------------------------------\n// Builds the Groq chat-completions body for the classification agent.\n// temperature 0 + fixed seed + JSON mode => repeatable verdicts.\n// -----------------------------------------------------------------------------\nconst apiKey = String($env.GROQ_API_KEY ?? '').trim();\nif (!apiKey) {\n  throw new Error('GROQ_API_KEY is empty. Put it in .env, then run: docker compose up -d --force-recreate n8n');\n}\n\nconst s = $json;\nconst roster = s.participants\n  .map((p) => `- ${p.name} (${p.is_team_member ? 'GenX team member' : 'external guest'})`)\n  .join('\\n');\n\nconst system = [\n  'You classify recorded meetings for the GenX Leadership Academy knowledge base.',\n  'Pick exactly one meeting_type:',\n  '- \"Client Coaching\": a GenX coach works with an external client leader on their leadership, mindset, team, delegation, feedback or personal effectiveness.',\n  '- \"Internal Operations\": GenX team members talking among themselves about the company\\'s own engineering, tooling, bugs, sprints, releases or admin.',\n  '- \"Sales Discovery\": a conversation about buying GenX services: pricing, budgets, retainers, contracts, pilots or scope of work.',\n  '- \"Other\": anything that fits none of the above.',\n  'confidence_score is your probability (0.0 to 1.0) that the chosen meeting_type is correct.',\n  'summary is one or two plain sentences describing what the meeting was about.',\n  'Respond with a single JSON object with exactly these keys:',\n  '{\"meeting_type\": \"Client Coaching | Internal Operations | Sales Discovery | Other\", \"confidence_score\": 0.0, \"summary\": \"...\"}',\n].join('\\n');\n\nconst user = [\n  `Meeting title: ${s.title}`,\n  'Participants:',\n  roster || '- (none listed)',\n  `Transcript sample (${s.sample_turn_count} of ${s.total_turn_count} turns):`,\n  s.sample_text,\n].join('\\n');\n\nreturn {\n  json: {\n    ...s,\n    classifier_request: {\n      model: $env.GROQ_MODEL || 'openai/gpt-oss-120b',\n      temperature: 0,\n      seed: 42,\n      // gpt-oss is a reasoning model: keep reasoning short and out of the reply,\n      // and leave enough budget so reasoning can never starve the JSON answer.\n      reasoning_effort: 'low',\n      include_reasoning: false,\n      max_tokens: 1200,\n      response_format: { type: 'json_object' },\n      messages: [\n        { role: 'system', content: system },\n        { role: 'user', content: user },\n      ],\n    },\n  },\n};\n"
+      },
+      "id": "b59458c4-c3d6-407a-a00d-52baabda2af4",
+      "name": "Build Classifier Request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        880,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.groq.com/openai/v1/chat/completions",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.GROQ_API_KEY }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.classifier_request) }}",
+        "options": {
+          "timeout": 60000
+        }
+      },
+      "id": "a09f7da3-4ad8-40ce-abc8-0a226bd34b06",
+      "name": "Classification Agent (Groq)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1100,
+        300
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Node: \"Parse Classification\"   (Code · Run Once for Each Item)\n// -----------------------------------------------------------------------------\n// Turns the raw LLM reply into a validated verdict. Never throws:\n// HTTP errors, empty replies, markdown fences, prose around the JSON, unknown\n// labels and out-of-range scores all degrade to a safe \"Other / 0.0\" verdict,\n// which the gate then archives instead of ingesting.\n// -----------------------------------------------------------------------------\nconst ALLOWED_TYPES = ['Client Coaching', 'Internal Operations', 'Sales Discovery', 'Other'];\nconst PASS_TYPE = 'Client Coaching';\nconst PASS_CONFIDENCE = 0.8;\n\n// Pair this reply with the session it belongs to (n8n paired-item linking).\nconst { classifier_request, ...session } = $('Build Classifier Request').item.json;\nconst reply = $json;\n\nfunction extractJsonObject(text) {\n  const cleaned = text.replace(/```(?:json)?/gi, '').trim();\n  const start = cleaned.indexOf('{');\n  const end = cleaned.lastIndexOf('}');\n  if (start === -1 || end <= start) throw new Error('No JSON object found in LLM reply');\n  return JSON.parse(cleaned.slice(start, end + 1));\n}\n\nconst normaliseType = (value) => {\n  const key = String(value ?? '').trim().toLowerCase();\n  return ALLOWED_TYPES.find((t) => t.toLowerCase() === key) ?? 'Other';\n};\n\nconst normaliseScore = (value) => {\n  const n = typeof value === 'string' ? parseFloat(value) : Number(value);\n  return Number.isFinite(n) ? Math.min(1, Math.max(0, n)) : 0;\n};\n\nlet verdict;\nlet parseError = null;\ntry {\n  if (reply.error) {\n    const msg = typeof reply.error === 'string' ? reply.error : reply.error.message ?? JSON.stringify(reply.error);\n    throw new Error(`Classifier request failed: ${msg}`);\n  }\n  const content = reply?.choices?.[0]?.message?.content;\n  if (typeof content !== 'string' || content.trim() === '') throw new Error('Empty classifier reply');\n  verdict = extractJsonObject(content);\n} catch (err) {\n  parseError = err.message;\n  verdict = {};\n}\n\nconst meeting_type = parseError ? 'Other' : normaliseType(verdict.meeting_type);\nconst confidence_score = parseError ? 0 : Math.round(normaliseScore(verdict.confidence_score) * 1000) / 1000;\nconst summary = typeof verdict.summary === 'string' && verdict.summary.trim()\n  ? verdict.summary.trim()\n  : (parseError ? `Classification unavailable: ${parseError}` : '');\n\nconst passes = meeting_type === PASS_TYPE && confidence_score >= PASS_CONFIDENCE;\nlet reject_reason = null;\nif (!passes) {\n  if (parseError) reject_reason = `classifier_error: ${parseError}`;\n  else if (meeting_type !== PASS_TYPE) reject_reason = `meeting_type=${meeting_type}`;\n  else reject_reason = `low_confidence=${confidence_score} (< ${PASS_CONFIDENCE})`;\n}\n\nreturn {\n  json: {\n    ...session,\n    meeting_type,\n    confidence_score,\n    summary,\n    gate_decision: passes ? 'ingest' : 'archive',\n    reject_reason,\n  },\n};\n"
+      },
+      "id": "acd72e60-66fa-458b-a5c6-99e0300eb69b",
+      "name": "Parse Classification",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1320,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "4868882f-f175-4afd-aeed-aa3aa094eda4",
+                    "leftValue": "={{ $json.meeting_type }}",
+                    "rightValue": "Client Coaching",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  },
+                  {
+                    "id": "69724d75-87fa-4fc3-af96-628bcc324800",
+                    "leftValue": "={{ $json.confidence_score }}",
+                    "rightValue": 0.8,
+                    "operator": {
+                      "type": "number",
+                      "operation": "gte"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Pass: Client Coaching ≥ 0.80"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra",
+          "renameFallbackOutput": "Reject: Archive"
+        }
+      },
+      "id": "fea7dc27-2a3f-4303-afd0-586e22847486",
+      "name": "Ingestion Gate",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        1540,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Node: \"Build Framework Request\"   (Code · Run Once for Each Item)\n// -----------------------------------------------------------------------------\n// Stream 1 needs a *dense conceptual takeaway*, which is a summarisation task,\n// so an LLM distils it (temperature 0, JSON mode). The Dual-Stream Parser then\n// turns that JSON into the framework chunk text deterministically.\n//\n// It also returns `leader_questions`: first-person questions this session\n// answers. They are used as extra index vectors (multi-vector / doc2query\n// indexing) because bge-m3 question->passage similarity tops out ~0.55, below\n// the brief's 0.70 / 0.65 gates, while question->question similarity for a\n// genuine match is 0.72-0.77 and off-domain questions stay <= 0.57 (measured).\n// -----------------------------------------------------------------------------\nconst s = $json;\nconst coaches = s.participants.filter((p) => p.is_team_member).map((p) => p.name);\nconst fullTranscript = s.transcript\n  .map((t) => `[${t.timestamp ?? '--:--:--'}] ${t.speaker}: ${t.text.trim()}`)\n  .join('\\n');\n\nconst system = [\n  'You distil executive-coaching sessions into reusable framework cards for a knowledge base.',\n  `The coach is ${coaches.join(' / ') || 'the GenX team member'}.`,\n  'Work only from what the coach actually says in the transcript, and keep the coach\\'s own name for each framework.',\n  'Write dense, specific sentences that someone could act on without reading the transcript.',\n  'Return one JSON object in this shape:',\n  '{\"frameworks\": [{',\n  '  \"name\": \"framework name as the coach calls it\",',\n  '  \"problem\": \"the leadership problem it solves, 1-2 sentences\",',\n  '  \"core_principle\": \"the central idea, 1-2 sentences\",',\n  '  \"method\": [\"step 1\", \"step 2\", \"step 3\"],',\n  '  \"key_question\": \"the diagnostic question or rule the coach gives, verbatim where possible\",',\n  '  \"outcome\": \"what changes when the leader applies it\"',\n  '}],',\n  ' \"leader_questions\": [\"10 questions\"]}',\n  'Include one framework entry per distinct framework the coach teaches (usually one).',\n  'For leader_questions, write 10 distinct questions this session\\'s advice answers, the way a leader would type them to an executive coach:',\n  'first person (\"How should I...\", \"How do I...\", \"What do I do when...\"), naming the concrete situation (the role, the symptom, the relationship),',\n  'and covering different angles: the presenting problem, the underlying cause, the conversation to have, and the next step.',\n].join('\\n');\n\nreturn {\n  json: {\n    ...s,\n    framework_request: {\n      model: $env.GROQ_MODEL || 'openai/gpt-oss-120b',\n      temperature: 0,\n      seed: 42,\n      reasoning_effort: 'low',\n      include_reasoning: false,\n      max_tokens: 2500,\n      response_format: { type: 'json_object' },\n      messages: [\n        { role: 'system', content: system },\n        { role: 'user', content: `Session ${s.session_id}: ${s.title}\\n\\nTranscript:\\n${fullTranscript}` },\n      ],\n    },\n  },\n};\n"
+      },
+      "id": "ce181e34-678f-477b-afba-d49c13ca631f",
+      "name": "Build Framework Request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1780,
+        180
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.groq.com/openai/v1/chat/completions",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.GROQ_API_KEY }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.framework_request) }}",
+        "options": {
+          "timeout": 60000
+        }
+      },
+      "id": "777a8594-2b11-4bd9-ad88-b2ca952df3f3",
+      "name": "Extract Framework (Groq)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2000,
+        180
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Node: \"Dual-Stream Parser\"   (Code · Run Once for All Items)\n// -----------------------------------------------------------------------------\n// For every APPROVED coaching session, emit two streams of chunks:\n//   Stream 1  framework     dense conceptual takeaway (from the LLM's framework card)\n//   Stream 2  voice_sample  the coach's verbatim turns only, packed into\n//                           400-700 character chunks on sentence boundaries\n// Output: one n8n item per (chunk x index text), ready to be embedded.\n//   Every chunk is indexed by its own passage text AND by each leader question\n//   the session answers (multi-vector indexing). All rows of one chunk share a\n//   chunk_key, and retrieval de-duplicates on it. `content` is always the real\n//   framework card / verbatim coach text; only the vector's source text differs.\n// -----------------------------------------------------------------------------\nconst MIN_CHARS = 400;\nconst MAX_CHARS = 700;\n\n// ---------- Stream 2 helpers: verbatim coach dialogue ----------\nconst clean = (text) => text.replace(/\\s+/g, ' ').trim();\n\n// Split a turn into sentences, keeping punctuation and closing quotes attached.\nfunction toSentences(text) {\n  return clean(text)\n    .split(/(?<=[.!?][\"'’”)]?)\\s+(?=[\"'‘“(]?[A-Z0-9])/)\n    .map((s) => s.trim())\n    .filter(Boolean);\n}\n\n// A sentence longer than MAX_CHARS (rare) is cut on a word boundary.\nfunction capLength(sentence) {\n  if (sentence.length <= MAX_CHARS) return [sentence];\n  const parts = [];\n  let rest = sentence;\n  while (rest.length > MAX_CHARS) {\n    const cut = rest.lastIndexOf(' ', MAX_CHARS);\n    const at = cut > 0 ? cut : MAX_CHARS;\n    parts.push(rest.slice(0, at).trim());\n    rest = rest.slice(at).trim();\n  }\n  if (rest) parts.push(rest);\n  return parts;\n}\n\n// Same turn -> joined with a space; a new turn -> blank line, so the rhythm\n// of separate spoken turns is preserved inside a chunk.\nfunction render(units) {\n  return units\n    .map((u, i) => (i === 0 ? '' : u.turn === units[i - 1].turn ? ' ' : '\\n\\n') + u.text)\n    .join('');\n}\n\nfunction packVoiceChunks(coachTurns) {\n  const units = [];\n  coachTurns.forEach((turn, turnIndex) => {\n    for (const sentence of toSentences(turn.text)) {\n      for (const piece of capLength(sentence)) units.push({ text: piece, turn: turnIndex, ts: turn.timestamp });\n    }\n  });\n  if (units.length === 0) return [];\n\n  // 1) Greedy pack up to MAX_CHARS.\n  const chunks = [];\n  let current = [];\n  for (const unit of units) {\n    if (current.length && render([...current, unit]).length > MAX_CHARS) {\n      chunks.push(current);\n      current = [];\n    }\n    current.push(unit);\n  }\n  if (current.length) chunks.push(current);\n\n  // 2) Rebalance a short tail: borrow whole sentences from the previous chunk\n  //    while both stay inside the window; otherwise merge if the result fits.\n  for (let i = chunks.length - 1; i > 0; i--) {\n    const prev = chunks[i - 1];\n    const last = chunks[i];\n    while (render(last).length < MIN_CHARS && prev.length > 1) {\n      const candidatePrev = prev.slice(0, -1);\n      const candidateLast = [prev[prev.length - 1], ...last];\n      if (render(candidatePrev).length < MIN_CHARS || render(candidateLast).length > MAX_CHARS) break;\n      prev.pop();\n      last.unshift(candidateLast[0]);\n    }\n    if (render(last).length < MIN_CHARS && render([...prev, ...last]).length <= MAX_CHARS) {\n      chunks.splice(i - 1, 2, [...prev, ...last]);\n    }\n  }\n\n  // 3) If sentence boundaries make a 400-700 split impossible (e.g. 836 chars of\n  //    coach text => 458 + 384), give the short chunk a whole-sentence OVERLAP\n  //    from the end of the previous chunk. Sentences stay intact and verbatim.\n  const result = chunks.map((units) => ({ units, overlap: 0 }));\n  for (let i = 1; i < result.length; i++) {\n    const prev = chunks[i - 1];\n    let k = prev.length - 1;\n    while (render(result[i].units).length < MIN_CHARS && k >= 0) {\n      const candidate = [prev[k], ...result[i].units];\n      if (render(candidate).length > MAX_CHARS) break;\n      result[i].units = candidate;\n      result[i].overlap += 1;\n      k -= 1;\n    }\n  }\n\n  return result.map(({ units, overlap }) => ({\n    content: render(units),\n    timestamps: [...new Set(units.map((u) => u.ts))],\n    overlap_sentences: overlap,\n  }));\n}\n\n// ---------- Stream 1 helpers: framework card -> dense text ----------\nconst asList = (v) => (Array.isArray(v) ? v : v ? [v] : []).map((x) => clean(String(x))).filter(Boolean);\n\nfunction parseFrameworks(reply) {\n  try {\n    if (reply.error) return { frameworks: [], questions: [], error: String(reply.error.message ?? reply.error) };\n    const content = reply?.choices?.[0]?.message?.content ?? '';\n    const cleaned = content.replace(/```(?:json)?/gi, '').trim();\n    const parsed = JSON.parse(cleaned.slice(cleaned.indexOf('{'), cleaned.lastIndexOf('}') + 1));\n    const list = Array.isArray(parsed.frameworks) ? parsed.frameworks : [parsed];\n    const questions = [...new Set(asList(parsed.leader_questions))].slice(0, 12);\n    return { frameworks: list.filter((f) => f && typeof f.name === 'string' && f.name.trim()), questions, error: null };\n  } catch (err) {\n    return { frameworks: [], questions: [], error: err.message };\n  }\n}\n\nfunction frameworkText(fw, session, coachName) {\n  const method = asList(fw.method);\n  return [\n    `Framework: ${clean(fw.name)} (taught by ${coachName}, session ${session.session_id})`,\n    fw.problem && `Problem it solves: ${clean(fw.problem)}`,\n    fw.core_principle && `Core principle: ${clean(fw.core_principle)}`,\n    method.length && `How to run it: ${method.map((m, i) => `${i + 1}) ${m}`).join(' ')}`,\n    fw.key_question && `Key question / rule: ${clean(fw.key_question)}`,\n    fw.outcome && `Outcome: ${clean(fw.outcome)}`,\n  ].filter(Boolean).join('\\n');\n}\n\n// One row per index text: the passage itself + every leader question.\nconst indexTexts = (content, questions) => [\n  { index_kind: 'passage', index_text: content },\n  ...questions.map((q) => ({ index_kind: 'question', index_text: q })),\n];\n\n// ---------- Main ----------\nconst out = [];\n\n$input.all().forEach((item, index) => {\n  const { framework_request, ...session } = $('Build Framework Request').itemMatching(index).json;\n  const coachNames = new Set(session.participants.filter((p) => p.is_team_member).map((p) => p.name));\n  const coachName = [...coachNames].join(' / ') || 'coach';\n  const baseMeta = {\n    source: 'mock_transcripts.json',\n    title: session.title,\n    session_created_at: session.session_created_at,\n    coach: coachName,\n    meeting_type: session.meeting_type,\n    confidence_score: session.confidence_score,\n  };\n  const sessionInfo = {\n    session_id: session.session_id,\n    title: session.title,\n    meeting_type: session.meeting_type,\n    confidence_score: session.confidence_score,\n    summary: session.summary,\n  };\n\n  // Stream 1: framework\n  const { frameworks, questions, error } = parseFrameworks(item.json);\n  const frameworkChunks = frameworks.length\n    ? frameworks.map((fw) => ({ content: frameworkText(fw, session, coachName), framework_name: clean(fw.name) }))\n    : [{ // safe fallback: never lose an approved session because extraction failed\n        content: `Coaching takeaway (session ${session.session_id}, ${coachName}): ${session.summary}`,\n        framework_name: null,\n        extraction_error: error,\n      }];\n\n  // Stream 2: voice_sample (coach turns only)\n  const coachTurns = session.transcript.filter((t) => coachNames.has(t.speaker));\n  const voiceChunks = packVoiceChunks(coachTurns);\n\n  const frameworkName = frameworkChunks.find((fc) => fc.framework_name)?.framework_name ?? null;\n\n  const emit = (stream_type, chunk_index, content, metadata) => {\n    const chunk_key = `${session.session_id}:${stream_type}:${chunk_index}`;\n    for (const idx of indexTexts(content, questions)) {\n      out.push({\n        json: {\n          ...sessionInfo,\n          stream_type,\n          chunk_index,\n          chunk_key,\n          content,\n          index_kind: idx.index_kind,\n          index_text: idx.index_text,\n          metadata: { ...metadata, chunk_key, index_kind: idx.index_kind, index_text: idx.index_text },\n        },\n        pairedItem: { item: index },\n      });\n    }\n  };\n\n  frameworkChunks.forEach((fc, i) => emit('framework', i, fc.content, {\n    ...baseMeta,\n    framework_name: fc.framework_name,\n    char_count: fc.content.length,\n    ...(fc.extraction_error ? { extraction_error: fc.extraction_error } : {}),\n  }));\n\n  voiceChunks.forEach((vc, i) => emit('voice_sample', i, vc.content, {\n    ...baseMeta,\n    framework_name: frameworkName,\n    speaker: coachName,\n    char_count: vc.content.length,\n    within_400_700: vc.content.length >= MIN_CHARS && vc.content.length <= MAX_CHARS,\n    turn_timestamps: vc.timestamps,\n    overlap_sentences: vc.overlap_sentences,\n  }));\n});\n\nreturn out;\n"
+      },
+      "id": "131a7edf-8315-4d5a-a5c0-39f6ceae0d71",
+      "name": "Dual-Stream Parser",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2220,
+        180
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.OLLAMA_BASE_URL }}/api/embed",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: $env.EMBEDDING_MODEL || 'bge-m3', input: $json.index_text }) }}",
+        "options": {
+          "timeout": 120000
+        }
+      },
+      "id": "482cae1e-1ffa-4893-ad33-cbe798c5183e",
+      "name": "Embed Chunk (bge-m3)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2440,
+        180
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000
+    },
+    {
+      "parameters": {
+        "jsCode": "// Node: \"Build Vault Upsert SQL\"   (Code · Run Once for All Items)\n// -----------------------------------------------------------------------------\n// Joins every chunk with its bge-m3 embedding and writes ONE transactional SQL\n// statement per session: delete old rows -> insert fresh rows -> log decision.\n// Re-running ingestion therefore always converges to the same table contents.\n// -----------------------------------------------------------------------------\nconst EMBEDDING_DIM = 1024;\n\nconst toBase64 = (str) => (typeof Buffer !== 'undefined'\n  ? Buffer.from(str, 'utf8').toString('base64')\n  : btoa(unescape(encodeURIComponent(str))));\nconst text = (value) => `convert_from(decode('${toBase64(String(value ?? ''))}', 'base64'), 'UTF8')`;\nconst jsonb = (value) => `${text(JSON.stringify(value ?? {}))}::jsonb`;\n\nfunction vectorLiteral(embedding, label) {\n  if (!Array.isArray(embedding) || embedding.length !== EMBEDDING_DIM) {\n    throw new Error(`${label}: expected a ${EMBEDDING_DIM}-dim embedding, got ${Array.isArray(embedding) ? embedding.length : typeof embedding}`);\n  }\n  if (!embedding.every((n) => Number.isFinite(n))) throw new Error(`${label}: embedding contains non-numeric values`);\n  return `'[${embedding.join(',')}]'::vector(${EMBEDDING_DIM})`;\n}\n\n// Group chunks by session, preserving order.\nconst sessions = new Map();\n$input.all().forEach((item, index) => {\n  const chunk = $('Dual-Stream Parser').itemMatching(index).json;\n  const label = `${chunk.chunk_key ?? `${chunk.session_id}/${chunk.stream_type}#${chunk.chunk_index}`} [${chunk.index_kind ?? 'passage'}]`;\n  if (item.json.error) throw new Error(`${label}: embedding request failed: ${JSON.stringify(item.json.error)}`);\n  const embedding = item.json.embeddings?.[0] ?? item.json.embedding;\n  const row = { ...chunk, vector: vectorLiteral(embedding, label), inputIndex: index };\n  if (!sessions.has(chunk.session_id)) sessions.set(chunk.session_id, []);\n  sessions.get(chunk.session_id).push(row);\n});\n\nreturn [...sessions.entries()].map(([sessionId, rows]) => {\n  const first = rows[0];\n  const sid = text(sessionId);\n  // Count distinct chunks (a chunk has several index vectors).\n  const distinctChunks = (stream) => new Set(rows.filter((r) => r.stream_type === stream).map((r) => r.chunk_key)).size;\n  const frameworkCount = distinctChunks('framework');\n  const voiceCount = distinctChunks('voice_sample');\n\n  const values = rows\n    .map((r) => `  (${sid}, '${r.stream_type}', ${text(r.content)}, ${jsonb({ ...r.metadata, chunk_index: r.chunk_index })}, ${r.vector})`)\n    .join(',\\n');\n\n  const sql = `\nDELETE FROM knowledge_vault WHERE session_id = ${sid};\n\nINSERT INTO knowledge_vault (session_id, stream_type, content, metadata, embedding) VALUES\n${values};\n\nDELETE FROM archived_sessions WHERE session_id = ${sid};\n\nINSERT INTO ingestion_log\n  (session_id, title, meeting_type, confidence_score, summary, decision, reason, framework_chunks, voice_chunks, processed_at)\nVALUES\n  (${sid}, ${text(first.title)}, ${text(first.meeting_type)}, ${Number(first.confidence_score) || 0}, ${text(first.summary)},\n   'ingested', NULL, ${frameworkCount}, ${voiceCount}, now())\nON CONFLICT (session_id) DO UPDATE SET\n  title = EXCLUDED.title, meeting_type = EXCLUDED.meeting_type, confidence_score = EXCLUDED.confidence_score,\n  summary = EXCLUDED.summary, decision = EXCLUDED.decision, reason = NULL,\n  framework_chunks = EXCLUDED.framework_chunks, voice_chunks = EXCLUDED.voice_chunks, processed_at = now();\n\nSELECT ${sid} AS session_id, 'ingested' AS decision, ${frameworkCount} AS framework_chunks, ${voiceCount} AS voice_chunks, ${rows.length} AS index_vectors;\n`;\n\n  return {\n    json: { session_id: sessionId, framework_chunks: frameworkCount, voice_chunks: voiceCount, index_vectors: rows.length, sql },\n    pairedItem: rows.map((r) => ({ item: r.inputIndex })),\n  };\n});\n"
+      },
+      "id": "43732551-313e-439f-a61c-101ac4e24760",
+      "name": "Build Vault Upsert SQL",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2660,
+        180
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "={{ $json.sql }}",
+        "options": {}
+      },
+      "id": "c10e0915-69e5-4d9e-ad3a-9dde6c2ecb50",
+      "name": "Upsert knowledge_vault",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2880,
+        180
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "pgLocalGenxRag01",
+          "name": "Local pgvector (genx_rag)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Node: \"Build Archive SQL\"   (Code · Run Once for Each Item)\n// -----------------------------------------------------------------------------\n// Rejected sessions go to a flat relational table. No embeddings are created.\n// Text is passed to Postgres as base64 and decoded server-side, so quotes,\n// backslashes and \"$\" in transcripts can never break or inject into the SQL.\n// Re-running the workflow is idempotent (upserts + cleanup of stale vault rows).\n// -----------------------------------------------------------------------------\nconst toBase64 = (str) => (typeof Buffer !== 'undefined'\n  ? Buffer.from(str, 'utf8').toString('base64')\n  : btoa(unescape(encodeURIComponent(str))));\nconst text = (value) => `convert_from(decode('${toBase64(String(value ?? ''))}', 'base64'), 'UTF8')`;\nconst jsonb = (value) => `${text(JSON.stringify(value ?? null))}::jsonb`;\nconst tsOrNull = (value) => (value ? `${text(value)}::timestamptz` : 'NULL');\nconst num = (value) => (Number.isFinite(Number(value)) ? Number(value) : 0);\n\nconst s = $json;\nconst sid = text(s.session_id);\n\nconst sql = `\nINSERT INTO archived_sessions\n  (session_id, title, session_created_at, meeting_type, confidence_score, summary, reject_reason, participants, transcript, archived_at)\nVALUES\n  (${sid}, ${text(s.title)}, ${tsOrNull(s.session_created_at)}, ${text(s.meeting_type)}, ${num(s.confidence_score)},\n   ${text(s.summary)}, ${text(s.reject_reason)}, ${jsonb(s.participants)}, ${jsonb(s.transcript)}, now())\nON CONFLICT (session_id) DO UPDATE SET\n  title = EXCLUDED.title, session_created_at = EXCLUDED.session_created_at,\n  meeting_type = EXCLUDED.meeting_type, confidence_score = EXCLUDED.confidence_score,\n  summary = EXCLUDED.summary, reject_reason = EXCLUDED.reject_reason,\n  participants = EXCLUDED.participants, transcript = EXCLUDED.transcript, archived_at = now();\n\nDELETE FROM knowledge_vault WHERE session_id = ${sid};\n\nINSERT INTO ingestion_log\n  (session_id, title, meeting_type, confidence_score, summary, decision, reason, framework_chunks, voice_chunks, processed_at)\nVALUES\n  (${sid}, ${text(s.title)}, ${text(s.meeting_type)}, ${num(s.confidence_score)}, ${text(s.summary)}, 'archived', ${text(s.reject_reason)}, 0, 0, now())\nON CONFLICT (session_id) DO UPDATE SET\n  title = EXCLUDED.title, meeting_type = EXCLUDED.meeting_type, confidence_score = EXCLUDED.confidence_score,\n  summary = EXCLUDED.summary, decision = EXCLUDED.decision, reason = EXCLUDED.reason,\n  framework_chunks = 0, voice_chunks = 0, processed_at = now();\n\nSELECT ${sid} AS session_id, 'archived' AS decision, ${text(s.meeting_type)} AS meeting_type, ${num(s.confidence_score)} AS confidence_score;\n`;\n\nreturn { json: { session_id: s.session_id, meeting_type: s.meeting_type, sql } };\n"
+      },
+      "id": "26d2748b-c779-4242-ad44-564041dcf133",
+      "name": "Build Archive SQL",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1780,
+        440
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "={{ $json.sql }}",
+        "options": {}
+      },
+      "id": "35541aa7-e6fa-4d64-a055-55364bd5d3a9",
+      "name": "Archive Rejected Session",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2000,
+        440
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "pgLocalGenxRag01",
+          "name": "Local pgvector (genx_rag)"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Run Ingestion": {
+      "main": [
+        [
+          {
+            "node": "Read Transcripts File",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Transcripts File": {
+      "main": [
+        [
+          {
+            "node": "Extract JSON",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract JSON": {
+      "main": [
+        [
+          {
+            "node": "Split & Sample Transcripts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Split & Sample Transcripts": {
+      "main": [
+        [
+          {
+            "node": "Build Classifier Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Classifier Request": {
+      "main": [
+        [
+          {
+            "node": "Classification Agent (Groq)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classification Agent (Groq)": {
+      "main": [
+        [
+          {
+            "node": "Parse Classification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Classification": {
+      "main": [
+        [
+          {
+            "node": "Ingestion Gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ingestion Gate": {
+      "main": [
+        [
+          {
+            "node": "Build Framework Request",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Archive SQL",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Framework Request": {
+      "main": [
+        [
+          {
+            "node": "Extract Framework (Groq)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Framework (Groq)": {
+      "main": [
+        [
+          {
+            "node": "Dual-Stream Parser",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Dual-Stream Parser": {
+      "main": [
+        [
+          {
+            "node": "Embed Chunk (bge-m3)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Embed Chunk (bge-m3)": {
+      "main": [
+        [
+          {
+            "node": "Build Vault Upsert SQL",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Vault Upsert SQL": {
+      "main": [
+        [
+          {
+            "node": "Upsert knowledge_vault",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Archive SQL": {
+      "main": [
+        [
+          {
+            "node": "Archive Rejected Session",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  }
+}

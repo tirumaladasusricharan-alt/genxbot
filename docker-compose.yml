@@ -1,0 +1,147 @@
+# =============================================================================
+# GenX Bounded Dual-Stream RAG — one-command local stack
+#   docker compose up -d
+# Services:
+#   postgres     PostgreSQL 16 + pgvector, schema from init.sql
+#   ollama       local embedding server (bge-m3, 1024-dim)
+#   ollama-pull  one-shot: downloads bge-m3 into the ollama volume
+#   n8n-import   one-shot: imports the Postgres credential + both workflows
+#   n8n          the workflow engine (http://localhost:5678)
+# =============================================================================
+name: genx-rag
+
+x-n8n-common: &n8n-common
+  image: docker.n8n.io/n8nio/n8n:latest
+  environment:
+    # --- core ---
+    - N8N_HOST=localhost
+    - N8N_PORT=5678
+    - N8N_PROTOCOL=http
+    - N8N_WEBHOOK_URL=http://localhost:5678/
+    - GENERIC_TIMEZONE=UTC
+    - TZ=UTC
+    - N8N_ENCRYPTION_KEY=${N8N_ENCRYPTION_KEY:-genx-local-dev-only-encryption-key}
+    - N8N_DIAGNOSTICS_ENABLED=false
+    - N8N_PERSONALIZATION_ENABLED=false
+    # --- workflows read their config from env (no secrets inside workflow JSON) ---
+    - N8N_BLOCK_ENV_ACCESS_IN_NODE=false
+    - N8N_RESTRICT_FILE_ACCESS_TO=/data
+    - GROQ_API_KEY=${GROQ_API_KEY:-}
+    - GROQ_MODEL=${GROQ_MODEL:-openai/gpt-oss-120b}
+    - OLLAMA_BASE_URL=http://ollama:11434
+    - EMBEDDING_MODEL=bge-m3
+  volumes:
+    - n8n_data:/home/node/.n8n
+    - ./data:/data:ro
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: genx
+      POSTGRES_PASSWORD: genx_local_pw   # local-only test credential
+      POSTGRES_DB: genx_rag
+    ports:
+      - "5433:5432"                      # 5433 on the host avoids clashing with a local Postgres
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U genx -d genx_rag"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  ollama:
+    image: ollama/ollama:latest
+    restart: unless-stopped
+    environment:
+      # Keep bge-m3 resident. With the default 5-minute idle unload, the next
+      # query pays a ~70 s model reload on an 8 GB laptop (measured).
+      - OLLAMA_KEEP_ALIVE=-1
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  ollama-pull:
+    image: ollama/ollama:latest
+    environment:
+      - OLLAMA_HOST=ollama:11434
+    entrypoint: ["/bin/sh", "-c", "ollama pull bge-m3"]
+    depends_on:
+      ollama:
+        condition: service_healthy
+    restart: "no"
+
+  n8n-import:
+    <<: *n8n-common
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - >
+        n8n import:credentials --input=/import/credentials.json &&
+        n8n import:workflow --separate --input=/import/workflows
+    volumes:
+      - n8n_data:/home/node/.n8n
+      - ./data:/data:ro
+      - ./n8n/credentials.json:/import/credentials.json:ro
+      - ./workflows:/import/workflows:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  n8n:
+    <<: *n8n-common
+    restart: unless-stopped
+    ports:
+      - "5678:5678"
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://localhost:5678/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
+      interval: 5s
+      timeout: 5s
+      retries: 40
+    depends_on:
+      postgres:
+        condition: service_healthy
+      ollama-pull:
+        condition: service_completed_successfully
+      n8n-import:
+        condition: service_completed_successfully
+
+  # Publishing (activating) Workflow B must happen while n8n is RUNNING:
+  # a workflow published before n8n's very first boot does not get its
+  # webhooks registered until the next restart (observed on n8n 2.48).
+  n8n-publish:
+    <<: *n8n-common
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - >
+        n8n publish:workflow --id=GatedRetrieval01 &&
+        node -e "
+        const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+        const ping = () => fetch('http://n8n:5678/webhook/coach', {method:'POST', headers:{'content-type':'application/json'}, body:'{\"question\":\"Hello\"}'});
+        (async () => {
+          const t = Date.now();
+          const warm = await fetch('http://ollama:11434/api/embed', {method:'POST', body: JSON.stringify({model:'bge-m3', input:'warm-up', keep_alive:-1})});
+          console.log('bge-m3 loaded into memory (' + warm.status + ') in ' + Math.round((Date.now()-t)/1000) + 's');
+          for (let i = 0; i < 60; i++) { try { if ((await ping()).ok) { console.log('Workflow B webhook is live: POST http://localhost:5678/webhook/coach'); process.exit(0); } } catch {} await sleep(2000); }
+          console.error('Webhook did not come up within 120s'); process.exit(1);
+        })();"
+    depends_on:
+      n8n:
+        condition: service_healthy
+    restart: "no"
+
+volumes:
+  pg_data:
+  ollama_data:
+  n8n_data:

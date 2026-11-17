@@ -1,0 +1,425 @@
+{
+  "id": "GatedRetrieval01",
+  "name": "B · Gated Retrieval & Persona Synthesis",
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner"
+  },
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": true
+  },
+  "tags": [],
+  "nodes": [
+    {
+      "parameters": {
+        "options": {}
+      },
+      "id": "c17e103f-3c12-41ad-a29a-e6beddb1241f",
+      "name": "Chat",
+      "type": "@n8n/n8n-nodes-langchain.chatTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        0,
+        200
+      ],
+      "webhookId": "8759bb73-3f6d-400f-adce-97f4b2a3e4c6"
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "coach",
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "id": "df2107c1-ca03-4574-a558-1cd81a85f428",
+      "name": "POST /webhook/coach",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        420
+      ],
+      "webhookId": "decaae59-578b-4cd3-aad3-90b2b68a263f"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Node: \"Normalize & Detect Intent\"   (Code · Run Once for Each Item)\n// -----------------------------------------------------------------------------\n// Accepts both entry points (n8n Chat Trigger and the POST /webhook/coach API)\n// and flags pure greetings with a regex, so \"Hi\" never touches the database\n// or the LLM. \"Hi, how do I handle X?\" is NOT a pure greeting and is answered.\n// -----------------------------------------------------------------------------\nconst GREETING = /^(?:hi|hello|hey|hiya|howdy|greetings|yo|good\\s+(?:morning|afternoon|evening|day))(?:[\\s,]+(?:there|all|team|coach|sara|dr\\.?\\s*sara(?:\\s+hegy)?))?[\\s!.,?]*$/i;\n\nconst raw = $json.chatInput ?? $json.body?.question ?? $json.body?.chatInput ?? $json.query?.question ?? $json.question ?? '';\nconst question = String(raw).replace(/\\s+/g, ' ').trim();\n\nreturn {\n  json: {\n    question,\n    is_greeting: question === '' || GREETING.test(question),\n    channel: $json.chatInput !== undefined ? 'chat' : 'webhook',\n  },\n};\n"
+      },
+      "id": "26579297-6796-4ae3-a08c-c51c9935d1fb",
+      "name": "Normalize & Detect Intent",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "0d6b194e-451d-40f9-ad8f-4e22955bd5a0",
+              "leftValue": "={{ $json.is_greeting }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "fd8294c9-f995-46e8-ac91-08463d36218f",
+      "name": "Intent Router",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        460,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Node: \"Static Greeting\"   (Code · Run Once for Each Item)\n// No database lookup, no LLM call.\nreturn {\n  json: {\n    output: \"Hello! I'm the GenX coaching assistant, grounded in Dr. Sara Hegy's documented frameworks. Ask me a leadership question, for example: \\\"How should I approach an underperforming VP?\\\"\",\n    route: 'greeting',\n    llm_called: false,\n    matched_chunks: 0,\n    sources: [],\n  },\n};\n"
+      },
+      "id": "0fa82d61-7547-48c4-a890-a532ad8aa594",
+      "name": "Static Greeting",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        700,
+        160
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.OLLAMA_BASE_URL }}/api/embed",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: $env.EMBEDDING_MODEL || 'bge-m3', input: $json.question }) }}",
+        "options": {
+          "timeout": 120000
+        }
+      },
+      "id": "02a8a1c4-b88d-48b7-ad52-f3ce3538710b",
+      "name": "Embed Query (bge-m3)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        700,
+        420
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Node: \"Build Gated SQL\"   (Code · Run Once for Each Item)\n// -----------------------------------------------------------------------------\n// Builds the raw pgvector query. Each stream has its OWN hard similarity floor:\n//   framework     1 - (embedding <=> q) >= 0.70   LIMIT 2\n//   voice_sample  1 - (embedding <=> q) >= 0.65   LIMIT 2\n// A chunk is stored with several index vectors (its passage + the leader\n// questions it answers), so each stream keeps only the best-scoring vector per\n// chunk_key before applying LIMIT 2. Only numbers (the query vector) are\n// interpolated, so the user's text can never reach the SQL string.\n// -----------------------------------------------------------------------------\nconst EMBEDDING_DIM = 1024;\nconst FRAMEWORK_MIN_SIMILARITY = 0.70;\nconst VOICE_MIN_SIMILARITY = 0.65;\nconst PER_STREAM_LIMIT = 2;\n\nif ($json.error) throw new Error(`Query embedding failed: ${JSON.stringify($json.error)}`);\nconst embedding = $json.embeddings?.[0] ?? $json.embedding;\nif (!Array.isArray(embedding) || embedding.length !== EMBEDDING_DIM || !embedding.every(Number.isFinite)) {\n  throw new Error(`Expected a ${EMBEDDING_DIM}-dim query embedding from bge-m3`);\n}\n\nconst q = `'[${embedding.join(',')}]'::vector(${EMBEDDING_DIM})`;\n\nconst gatedStream = (stream, minSimilarity) => `\n  SELECT * FROM (\n    SELECT DISTINCT ON (kv.metadata->>'chunk_key')\n           kv.id, kv.session_id, kv.stream_type, kv.content, kv.metadata,\n           1 - (kv.embedding <=> query.v) AS similarity\n    FROM knowledge_vault kv, query\n    WHERE kv.stream_type = '${stream}'\n      AND 1 - (kv.embedding <=> query.v) >= ${minSimilarity}\n    ORDER BY kv.metadata->>'chunk_key', kv.embedding <=> query.v\n  ) best_per_chunk\n  ORDER BY similarity DESC\n  LIMIT ${PER_STREAM_LIMIT}`;\n\nconst sql = `\nWITH query AS (SELECT ${q} AS v),\nframeworks AS (${gatedStream('framework', FRAMEWORK_MIN_SIMILARITY)}\n),\nvoice_samples AS (${gatedStream('voice_sample', VOICE_MIN_SIMILARITY)}\n)\nSELECT * FROM frameworks\nUNION ALL\nSELECT * FROM voice_samples\nORDER BY stream_type, similarity DESC;\n`;\n\nreturn { json: { question: $('Normalize & Detect Intent').item.json.question, sql } };\n"
+      },
+      "id": "0e0846b5-ef6a-489e-a5da-6334ba7f8632",
+      "name": "Build Gated SQL",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        920,
+        420
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "={{ $json.sql }}",
+        "options": {}
+      },
+      "id": "36875e9d-ff20-4424-a0d4-08af5f2d1cc6",
+      "name": "Gated Vector Search",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1140,
+        420
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "pgLocalGenxRag01",
+          "name": "Local pgvector (genx_rag)"
+        }
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// Node: \"Collect Matches\"   (Code · Run Once for All Items)\n// -----------------------------------------------------------------------------\n// \"Gated Vector Search\" has \"Always Output Data\" on, so a zero-row result still\n// arrives here as one empty item. Real rows are the ones that carry an id.\n// -----------------------------------------------------------------------------\nconst rows = $input.all()\n  .map((item) => item.json)\n  .filter((row) => row && row.id !== undefined && row.id !== null && typeof row.content === 'string');\n\nconst toMatch = (row) => ({\n  id: Number(row.id),\n  session_id: row.session_id,\n  stream_type: row.stream_type,\n  similarity: Math.round(Number(row.similarity) * 10000) / 10000,\n  content: row.content,\n  framework_name: row.metadata?.framework_name ?? null,\n  matched_on: row.metadata?.index_kind === 'question' ? row.metadata.index_text : 'passage',\n});\n\nconst frameworks = rows.filter((r) => r.stream_type === 'framework').map(toMatch);\nconst voice_samples = rows.filter((r) => r.stream_type === 'voice_sample').map(toMatch);\n\nreturn [{\n  json: {\n    question: $('Normalize & Detect Intent').first().json.question,\n    match_count: frameworks.length + voice_samples.length,\n    frameworks,\n    voice_samples,\n  },\n}];\n"
+      },
+      "id": "da598e8a-bce0-4d7b-a8a9-5c4775aa55cb",
+      "name": "Collect Matches",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1360,
+        420
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "ed8e1f60-9c74-4cf0-a77a-7a431e6325bf",
+              "leftValue": "={{ $json.match_count }}",
+              "rightValue": 0,
+              "operator": {
+                "type": "number",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "a2d34e44-0beb-4897-a379-168a964159e2",
+      "name": "Zero-Match Circuit Breaker",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1580,
+        420
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Node: \"Circuit Breaker Fallback\"   (Code · Run Once for Each Item)\n// Zero chunks cleared the similarity gate: answer with the fixed fallback.\n// The LLM node sits on the other branch and is never executed on this path.\nreturn {\n  json: {\n    output: 'No documented coaching frameworks match this topic.',\n    route: 'circuit_breaker',\n    llm_called: false,\n    matched_chunks: 0,\n    sources: [],\n  },\n};\n"
+      },
+      "id": "5f48ddbd-aee3-4434-ad4e-838f06e1b057",
+      "name": "Circuit Breaker Fallback",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1820,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Node: \"Build Persona Request\"   (Code · Run Once for Each Item)\n// -----------------------------------------------------------------------------\n// Persona synthesis with POSITIVE few-shot prompting: the system prompt says\n// what good looks like, and two worked examples (user CONTEXT+QUESTION ->\n// assistant answer) show the exact tone and structure to copy. No ban lists.\n// Retrieved frameworks supply the substance; voice samples supply the rhythm.\n// -----------------------------------------------------------------------------\nconst { question, frameworks, voice_samples } = $json;\n\nconst SYSTEM = [\n  'You are Dr. Sara Hegy, executive coach at GenX Leadership Academy, answering a senior leader.',\n  'How you answer:',\n  '- Open with a short, direct reframe that treats the problem as a system or structure issue.',\n  '- Name the framework from the CONTEXT and walk the leader through it in clear, numbered steps.',\n  '- Speak in the rhythm of the VOICE SAMPLES: short declarative sentences, second person, phrases such as \"Look,\" and \"The reality is\", and images of architecture, containers, signal and load.',\n  '- Build every idea from the CONTEXT block. When the CONTEXT covers only part of the question, answer that part well and keep it brief.',\n  '- Close with one concrete action for this week.',\n  '- Stay under 220 words.',\n].join('\\n');\n\n// ---- Positive few-shot examples (tone + structure to imitate) ----\nconst EXAMPLE_1_USER = `CONTEXT\n[FRAMEWORK | SES-101]\nFramework: Completion with Integrity. Define binary exit criteria before a strategic initiative starts, then enforce pre-agreed handoff constraints instead of status check-ins.\n\n[VOICE SAMPLE | SES-101]\n\"Look, Mark, micromanagement is almost never an ego problem. It is an information architecture breakdown.\"\n\nQUESTION\nI keep re-checking my managers' work before it goes to clients. How do I stop?`;\n\nconst EXAMPLE_1_ASSISTANT = `Look, the re-checking is not a character flaw. It is an information architecture breakdown. Your system is bleeding signal, so you step in to plug the leak.\n\nThe framework is Completion with Integrity:\n1. Before the next client deliverable starts, sit with its owner and write the binary exit criteria. Done means these conditions are true. Nothing vague.\n2. Agree the handoff constraints up front: what is reviewed, by whom, and when.\n3. Stop asking \"How is this going?\" Let the criteria carry the quality control.\n\nWhen clarity goes up, surveillance drops.\n\nThis week: pick one deliverable, write its exit criteria with the owner, and step out of the daily review.`;\n\nconst EXAMPLE_2_USER = `CONTEXT\n[FRAMEWORK | SES-101]\nFramework: Completion with Integrity. Top performers fail against ambiguous standards, not capability; clear exit criteria remove the need for surveillance.\n\n[VOICE SAMPLE | SES-101]\n\"Exactly. Protect your cognitive bandwidth. Let the architecture do the quality control, not your adrenaline.\"\n\nQUESTION\nI'm exhausted from being the final quality gate on everything.`;\n\nconst EXAMPLE_2_ASSISTANT = `The reality is, you are running quality control on adrenaline. That load is not sustainable, and it is not your job.\n\nYour people are not failing on capability. They are failing against ambiguous standards. So we fix the standard, not the people:\n1. List the three deliverables you check most often.\n2. For each one, define binary exit criteria with the owner before work begins.\n3. Hand off against those criteria and stay out of the middle.\n\nProtect your cognitive bandwidth. Let the architecture do the quality control.\n\nThis week: hand one of those three deliverables back to its owner with written exit criteria, and do not review it until it is done.`;\n\n// ---- Real context from the gated retrieval ----\nconst fmt = (m, label) => `[${label} | ${m.session_id} | similarity ${m.similarity.toFixed(2)}]\\n${label === 'VOICE SAMPLE' ? `\"${m.content}\"` : m.content}`;\nconst context = [\n  ...frameworks.map((m) => fmt(m, 'FRAMEWORK')),\n  ...voice_samples.map((m) => fmt(m, 'VOICE SAMPLE')),\n].join('\\n\\n');\n\nreturn {\n  json: {\n    ...$json,\n    persona_request: {\n      model: $env.GROQ_MODEL || 'openai/gpt-oss-120b',\n      temperature: 0,\n      seed: 42,\n      reasoning_effort: 'low',\n      include_reasoning: false,\n      max_tokens: 2000,\n      messages: [\n        { role: 'system', content: SYSTEM },\n        { role: 'user', content: EXAMPLE_1_USER },\n        { role: 'assistant', content: EXAMPLE_1_ASSISTANT },\n        { role: 'user', content: EXAMPLE_2_USER },\n        { role: 'assistant', content: EXAMPLE_2_ASSISTANT },\n        { role: 'user', content: `CONTEXT\\n${context}\\n\\nQUESTION\\n${question}` },\n      ],\n    },\n  },\n};\n"
+      },
+      "id": "340d7118-c79a-42ca-a4de-82fc4651a90b",
+      "name": "Build Persona Request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1820,
+        540
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.groq.com/openai/v1/chat/completions",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.GROQ_API_KEY }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.persona_request) }}",
+        "options": {
+          "timeout": 60000
+        }
+      },
+      "id": "3d7b287c-691e-44f2-a4ba-b1c7e97e932a",
+      "name": "Persona Synthesis (Groq)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2040,
+        540
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Node: \"Format Answer\"   (Code · Run Once for Each Item)\n// -----------------------------------------------------------------------------\n// Returns the persona answer plus the exact chunks it was grounded on.\n// \"output\" is the field the n8n Chat Trigger displays.\n// -----------------------------------------------------------------------------\nconst ctx = $('Build Persona Request').item.json;\nconst answer = $json?.choices?.[0]?.message?.content;\n\nconst sources = [...ctx.frameworks, ...ctx.voice_samples].map((m) => ({\n  session_id: m.session_id,\n  stream_type: m.stream_type,\n  similarity: m.similarity,\n  ...(m.framework_name ? { framework_name: m.framework_name } : {}),\n  ...(m.matched_on ? { matched_on: m.matched_on } : {}),\n}));\n\nif (typeof answer !== 'string' || answer.trim() === '') {\n  const reason = $json?.error ? JSON.stringify($json.error) : 'empty LLM response';\n  return {\n    json: {\n      output: 'The coaching assistant could not generate an answer right now. Please try again in a moment.',\n      route: 'llm_error',\n      llm_called: true,\n      error: reason,\n      matched_chunks: ctx.match_count,\n      sources,\n    },\n  };\n}\n\nreturn {\n  json: {\n    output: answer.trim(),\n    route: 'persona_answer',\n    llm_called: true,\n    matched_chunks: ctx.match_count,\n    sources,\n  },\n};\n"
+      },
+      "id": "e675ed11-94eb-4662-ae83-5b389419bd50",
+      "name": "Format Answer",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2260,
+        540
+      ]
+    }
+  ],
+  "connections": {
+    "Chat": {
+      "main": [
+        [
+          {
+            "node": "Normalize & Detect Intent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "POST /webhook/coach": {
+      "main": [
+        [
+          {
+            "node": "Normalize & Detect Intent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize & Detect Intent": {
+      "main": [
+        [
+          {
+            "node": "Intent Router",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Intent Router": {
+      "main": [
+        [
+          {
+            "node": "Static Greeting",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Embed Query (bge-m3)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Embed Query (bge-m3)": {
+      "main": [
+        [
+          {
+            "node": "Build Gated SQL",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Gated SQL": {
+      "main": [
+        [
+          {
+            "node": "Gated Vector Search",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gated Vector Search": {
+      "main": [
+        [
+          {
+            "node": "Collect Matches",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Collect Matches": {
+      "main": [
+        [
+          {
+            "node": "Zero-Match Circuit Breaker",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Zero-Match Circuit Breaker": {
+      "main": [
+        [
+          {
+            "node": "Circuit Breaker Fallback",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Persona Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Persona Request": {
+      "main": [
+        [
+          {
+            "node": "Persona Synthesis (Groq)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Persona Synthesis (Groq)": {
+      "main": [
+        [
+          {
+            "node": "Format Answer",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  }
+}
