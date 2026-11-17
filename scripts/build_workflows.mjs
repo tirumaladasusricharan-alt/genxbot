@@ -8,7 +8,8 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
-const code = (path) => readFileSync(join(ROOT, 'n8n-code', path), 'utf8');
+// Normalise line endings so a Windows checkout (CRLF) builds byte-identical JSON.
+const code = (path) => readFileSync(join(ROOT, 'n8n-code', path), 'utf8').replace(/\r\n/g, '\n');
 
 const uuid = (seed) => {
   const h = createHash('sha256').update(seed).digest('hex');
